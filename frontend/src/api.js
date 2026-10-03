@@ -1,11 +1,12 @@
 /**
- * API client for the Django REST Framework backend.
+ * Unified API Client with Full Hybrid Client/Server HOS Engine.
  *
- * In development, Vite proxies `/api/*` to Django at 127.0.0.1:8000.
- * In production on Vercel, set `VITE_API_BASE_URL` to your deployed API backend (e.g. Render/Railway).
- * An intelligent offline fallback is included so the hosted demo on Vercel remains 100% testable
- * even if the free-tier backend is spinning up or offline.
+ * In local development with Django running, requests route to the Django REST API.
+ * In standalone hosted environments (like Vercel when only the frontend is hosted),
+ * requests gracefully execute the full 49 CFR §395.3 simulation engine directly in the browser.
+ * This completely prevents HTTP 405 / 404 errors on static hosts.
  */
+
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/+$/, '')
 
 export const API_ORIGIN = API_BASE
@@ -26,7 +27,7 @@ function saveLocalTrip(trip) {
     const trips = getLocalTrips()
     const id = trip.id || Date.now()
     const storedTrip = { ...trip, id, created_at: trip.created_at || new Date().toISOString() }
-    const updated = [storedTrip, ...trips.filter((t) => t.id !== id)].slice(0, 30)
+    const updated = [storedTrip, ...trips.filter((t) => String(t.id) !== String(id))].slice(0, 30)
     localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(updated))
     return storedTrip
   } catch {
@@ -50,8 +51,13 @@ async function request(path, options = {}) {
       headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
       ...options,
     })
-  } catch (networkError) {
-    return null // Return null to signal network unreachable
+  } catch {
+    return null // Network error
+  }
+
+  // 405 Method Not Allowed or 404 Not Found means the static host (Vercel) doesn't have the API endpoint
+  if (response.status === 405 || response.status === 404) {
+    return null
   }
 
   const text = await response.text()
@@ -101,46 +107,68 @@ async function findFallbackPreset(payload) {
     return presetsFallback.restart
   }
 
-  // Default to the 3-day multi-day haul if not matching exactly
   return presetsFallback.i10
 }
 
 export async function planTrip(payload, { persist = true } = {}) {
   const path = persist ? '/api/trips/' : '/api/trips/plan/'
-  const data = await request(path, { method: 'POST', body: JSON.stringify(payload) })
+  let data = null
 
-  if (data) {
+  // 1. Attempt call to backend if available
+  try {
+    data = await request(path, { method: 'POST', body: JSON.stringify(payload) })
+  } catch (apiErr) {
+    console.warn('Backend request failed:', apiErr)
+  }
+
+  if (data && data.route && data.daily_logs) {
     if (persist && data.id) {
       saveLocalTrip(data)
     }
     return data
   }
 
-  // Fallback to high-accuracy precomputed verified HOS simulation
-  const fallback = await findFallbackPreset(payload)
-  const result = JSON.parse(JSON.stringify(fallback))
-  result.id = Date.now()
-  result.inputs = {
-    ...result.inputs,
-    current_location: payload.current_location,
-    pickup_location: payload.pickup_location,
-    dropoff_location: payload.dropoff_location,
-    current_cycle_used: payload.current_cycle_used,
-    start_time: payload.start_time,
+  // 2. Seamless client-side HOS simulation engine (for Vercel & static deployments)
+  try {
+    const { clientPlanTrip } = await import('./utils/clientHosEngine.js')
+    const result = await clientPlanTrip(payload)
+    if (persist) {
+      saveLocalTrip(result)
+    }
+    return result
+  } catch (clientErr) {
+    console.warn('Client simulation fallback to verified presets:', clientErr)
+    const fallback = await findFallbackPreset(payload)
+    const result = JSON.parse(JSON.stringify(fallback))
+    result.id = Date.now()
+    result.inputs = {
+      ...result.inputs,
+      current_location: payload.current_location,
+      pickup_location: payload.pickup_location,
+      dropoff_location: payload.dropoff_location,
+      current_cycle_used: payload.current_cycle_used,
+      start_time: payload.start_time,
+    }
+    if (persist) {
+      saveLocalTrip(result)
+    }
+    return result
   }
-  result.warnings = result.warnings || []
-  if (persist) {
-    saveLocalTrip(result)
-  }
-  return result
 }
 
 export async function listTrips() {
-  const data = await request('/api/trips/')
+  let data = null
+  try {
+    data = await request('/api/trips/')
+  } catch {
+    // ignore
+  }
+
   if (data && Array.isArray(data)) {
     return data
   }
-  // Return local storage trips if remote is unavailable
+
+  // Return local storage saved trips
   return getLocalTrips().map((t) => ({
     id: t.id,
     current_location: t.inputs?.current_location || t.current_location,
@@ -154,32 +182,50 @@ export async function listTrips() {
 }
 
 export async function getTrip(id) {
-  const data = await request(`/api/trips/${id}/`)
+  let data = null
+  try {
+    data = await request(`/api/trips/${id}/`)
+  } catch {
+    // ignore
+  }
+
   if (data) {
     return data.result ? { ...data.result, id: data.id, created_at: data.created_at } : data
   }
+
   const local = getLocalTrips().find((t) => String(t.id) === String(id))
   return local || null
 }
 
 export async function deleteTrip(id) {
-  await request(`/api/trips/${id}/`, { method: 'DELETE' })
+  try {
+    await request(`/api/trips/${id}/`, { method: 'DELETE' })
+  } catch {
+    // ignore
+  }
   deleteLocalTrip(id)
   return true
 }
 
 export async function suggestLocations(query) {
   const q = encodeURIComponent(query || '')
-  const data = await request(`/api/trips/suggest/?q=${q}`)
+  let data = null
+  try {
+    data = await request(`/api/trips/suggest/?q=${q}`)
+  } catch {
+    // ignore
+  }
+
   if (data && Array.isArray(data)) {
     return data
   }
 
-  // Offline fallback suggestions for key freight hubs
+  // Instant offline suggestions for major freight hubs
   const hubs = [
     'Atlanta, GA', 'Chicago, IL', 'Dallas, TX', 'Los Angeles, CA', 'Newark, NJ',
     'Philadelphia, PA', 'Phoenix, AZ', 'Seattle, WA', 'Miami, FL', 'Denver, CO',
     'Memphis, TN', 'Indianapolis, IN', 'Detroit, MI', 'Houston, TX', 'Baltimore, MD',
+    'Columbus, OH', 'Kansas City, MO', 'Charlotte, NC', 'Orlando, FL', 'Portland, OR',
   ]
   const lower = (query || '').toLowerCase()
   return hubs
